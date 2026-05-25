@@ -68,10 +68,18 @@ def info_dialog():
     st.markdown("### Limitations & Disclaimer")
     st.info("⚠ **Not Financial Advice.** Gold prices are influenced heavily by sudden geopolitical events, banking crises, and central bank physical buying — variables that a purely quantitative time-series model cannot capture. Real-world accuracy relies on history repeating itself.")
 
+def _show_ticker_warnings(fetch_status: dict[str, bool], sidebar_placeholder):
+    failed = [name for name, ok in fetch_status.items() if not ok]
+    if failed:
+        sidebar_placeholder.warning(
+            f"⚠️ External ticker(s) unavailable: {', '.join(failed)}. "
+            "Model running without these features."
+        )
+
 def execute_training():
     with st.spinner("Fetching full historical data..."):
         usd_idr_rate = fetch_usd_idr_rate()
-        df_raw = fetch_all_data()
+        df_raw, fetch_status = fetch_all_data()
         df_raw = convert_gold_to_idr(df_raw, usd_idr_rate)
         
     with st.spinner("Building extensive features..."):
@@ -80,7 +88,7 @@ def execute_training():
         
     with st.spinner(f"Evaluating Model via Walk-Forward Validation ({N_FOLDS}-fold)..."):
         splits = walk_forward_splits(df_feat, N_FOLDS)
-        wf_mape, mapes = walk_forward_evaluate(df_feat, feature_cols, splits)
+        wf_mape, fold_mapes, horizon_mapes = walk_forward_evaluate(df_feat, feature_cols, splits)
         
     with st.spinner("Training AR models for external futures..."):
         ar_models = train_ar_models(df_raw, df_feat.index)
@@ -89,10 +97,11 @@ def execute_training():
         final_suite = train_direct_suite(df_feat, df_feat.index, feature_cols)
         
     with st.spinner("Saving models to disk..."):
-        metrics = {"wf_mape": wf_mape}
+        metrics = {"wf_mape": wf_mape, "horizon_mapes": horizon_mapes, "feature_cols": feature_cols}
         save_models(ar_models, final_suite, metrics)
         
-    st.sidebar.success(f"Models Retrained & Saved Successfully! Walk-Forward MAPE: {wf_mape:.2f}%")
+    st.sidebar.success(f"Models Retrained & Saved Successfully! Avg MAPE: {wf_mape:.2f}%")
+    _show_ticker_warnings(fetch_status, st.sidebar)
     st.session_state.execute_retrain = False
 
 def main():
@@ -130,32 +139,47 @@ def main():
 
     auto_trigger = ("dashboard_data" not in st.session_state and ar_models is not None)
 
+    ticker_warnings = st.sidebar.empty()
+
     if refresh_clicked or auto_trigger:
         with st.spinner("Fetching latest data..."):
             usd_idr_rate = fetch_usd_idr_rate()
-            df_raw = fetch_all_data()
+            df_raw, fetch_status = fetch_all_data()
             df_raw = convert_gold_to_idr(df_raw, usd_idr_rate)
+            _show_ticker_warnings(fetch_status, ticker_warnings)
             
         with st.spinner("Building features for inference..."):
             df_feat = build_features(df_raw)
             feature_cols = get_feature_cols(df_feat)
-            
-        with st.spinner("Executing recursive forecasting..."):
-            forecast_df = forecast_with_recursive_externals(df_raw, df_feat, final_suite, ar_models, feature_cols)
-            
-        wf_mape = metrics.get("wf_mape", 0.0)
-        
-        st.session_state.dashboard_data = {
-            "df_raw": df_raw,
-            "forecast_df": forecast_df,
-            "wf_mape": wf_mape
-        }
+
+        trained_cols = metrics.get("feature_cols", [])
+        if set(feature_cols) != set(trained_cols):
+            missing = set(trained_cols) - set(feature_cols)
+            ticker_warnings.warning(
+                f"⚠️ Feature mismatch from training. Missing columns: {', '.join(sorted(missing))}. "
+                "Retrain the model to incorporate the current data."
+            )
+        else:
+            with st.spinner("Executing recursive forecasting..."):
+                forecast_df = forecast_with_recursive_externals(df_raw, df_feat, final_suite, ar_models, feature_cols)
+
+            wf_mape = metrics.get("wf_mape", 0.0)
+            horizon_mapes_display = metrics.get("horizon_mapes", [])
+
+            st.session_state.dashboard_data = {
+                "df_raw": df_raw,
+                "forecast_df": forecast_df,
+                "wf_mape": wf_mape,
+                "horizon_mapes": horizon_mapes_display,
+            }
 
     if "dashboard_data" in st.session_state:
         data = st.session_state.dashboard_data
         df_raw = data["df_raw"]
         forecast_df = data["forecast_df"]
         wf_mape = data["wf_mape"]
+        horizon_mapes_display = data.get("horizon_mapes", [])
+        mape_66d = horizon_mapes_display[-1] if len(horizon_mapes_display) >= 66 else wf_mape
 
         tab_overview, tab_data = st.tabs(["📈 Forecast Overview", "🗃️ Raw Data Extract"])
 
@@ -171,7 +195,7 @@ def main():
             
             with c2:
                 with st.container(border=True):
-                    st.metric("Walk-Forward MAPE", f"{wf_mape:.2f}%", delta="Historical Accuracy", delta_color="off")
+                    st.metric("66-Day Forecast MAPE", f"{mape_66d:.2f}%", delta="Historical Accuracy (Horizon 66)", delta_color="off")
             
             with c3:
                 with st.container(border=True):
